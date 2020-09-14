@@ -1,6 +1,13 @@
 # Deep Switching Auto-Regressive Factorization (DSARF)
 
-Codes and experiments for Deep switching auto-regressive factorization paper
+This repository is the implementation of our paper in the following arXiv preprint:
+
+@article{farnoosh2020,
+  title={Deep Switching Auto-Regressive Factorization: Application to Time Series Forecasting},
+  author={Farnoosh, Amirreza and Azari, Bahar and Ostadabbas, Sarah},
+  journal={https://arxiv.org/pdf/2009.05135.pdf},
+  year={2020}
+}
 
 
 ### Dependencies: 
