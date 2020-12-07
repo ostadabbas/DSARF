@@ -1,6 +1,6 @@
 # Deep Switching Auto-Regressive Factorization (DSARF)
 
-This repository is the implementation of our AAAI'21 paper in the following arXiv preprint:
+This repository is the implementation of our accepted AAAI'21 paper in the following arXiv preprint:
 
 @article{farnoosh2020,
   title={Deep Switching Auto-Regressive Factorization: Application to Time Series Forecasting},
