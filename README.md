@@ -5,8 +5,8 @@ This repository is the implementation of our accepted AAAI'21 paper in the follo
 @article{farnoosh2020,
   title={Deep Switching Auto-Regressive Factorization: Application to Time Series Forecasting},
   author={Farnoosh, Amirreza and Azari, Bahar and Ostadabbas, Sarah},
-  journal={https://arxiv.org/pdf/2009.05135.pdf},
-  year={2020}
+  journal={The Thirty-Fifth AAAI Conference on Artificial Intelligence (AAAI’21), https://arxiv.org/pdf/2009.05135.pdf},
+  year={2021}
 }
 
 
