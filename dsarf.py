@@ -1,27 +1,15 @@
 
 import numpy as np
-import argparse
 import torch, torch.nn as nn
 import torch.optim as optim
-from torch.utils import data
-from torch.autograd import Variable           
+from torch.utils.data import DataLoader         
 import os
 import time
-import sys
-'Unloading matplotlib to load it later with Agg backend'
-modules = []
-for module in sys.modules:
-    if module.startswith('matplotlib'):
-        modules.append(module)
-for module in modules:
-    sys.modules.pop(module)
-'##############'
 import matplotlib
-matplotlib.use('Agg')
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-print(' Processor is %s' % (device))
+#matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 import pdb
-from tqdm import tqdm
+from tqdm.notebook import tqdm
 
 
 def FC(shape = None, init = None):
@@ -41,45 +29,40 @@ class GatedTransition(nn.Module):
     """
     Parameterizes the gaussian latent transition probability p(z_t | z_{t-1}, s_t)
     """
-    def __init__(self, z_dim, u_dim, transition_dim, S, L):
+    def __init__(self, z_dim, transition_dim, S, L):
         super(GatedTransition, self).__init__()
         # initialize the linear transformations used in the neural network
         # g (scalar)
-        self.fc1_g, self.fc1_g_bias = FC([S, L, z_dim + u_dim, transition_dim])
+        self.fc1_g, self.fc1_g_bias = FC([S, L, z_dim, transition_dim])
         self.fc2_g, self.fc2_g_bias = FC([S, transition_dim, z_dim])
         # nonlinear z transition
-        self.fc1_z, self.fc1_z_bias = FC([S, L, z_dim + u_dim, transition_dim])
+        self.fc1_z, self.fc1_z_bias = FC([S, L, z_dim, transition_dim])
         self.fc2_z, self.fc2_z_bias = FC([S, transition_dim, z_dim])
         self.fc3_z, self.fc3_z_bias = FC([S, z_dim, z_dim])
         # linear z transition
-        init = [torch.eye(z_dim + u_dim, z_dim).repeat(S, L, 1, 1),
+        init = [torch.eye(z_dim, z_dim).repeat(S, L, 1, 1),
                 torch.zeros(1, z_dim).repeat(S, L, 1, 1)]
         self.fc_z, self.fc_z_bias = FC(init = init)
         # initialize the non-linearities used in the neural network
         self.relu = nn.PReLU()
         self.sigmoid = nn.Sigmoid()
 
-    def forward(self, z_t_1, u_t_1):
+    def forward(self, z_t_1):
         """
-        Given the latent z_{t-1} and stimuli u_{t-1} corresponding to the time
+        Given the latent z_{t-1} corresponding to the time
         step t-1, we return the mean and scale vectors that parameterize the
-        (diagonal) gaussian distribution p(z_t | z_{t-1}, u_{t-1})
-        z,u_{t-1} is L * Batch * z_dim
+        (diagonal) gaussian distribution p(z_t | z_{t-1})
+        z is L * Batch * z_dim
         """
-        # stack z and u in a single vector if u is available
-        if u_t_1 is not None:
-            zu_t_1 = torch.cat((z_t_1, u_t_1), dim = -1)
-        else:
-            zu_t_1 = z_t_1
-        _gate = self.relu(torch.matmul(zu_t_1, self.fc1_g) + self.fc1_g_bias) 
+        _gate = self.relu(torch.matmul(z_t_1, self.fc1_g) + self.fc1_g_bias) 
         gate = self.sigmoid(torch.matmul(_gate.mean(dim = 1), self.fc2_g) + self.fc2_g_bias)
         # compute the 'proposed mean'
-        _z_mean = self.relu(torch.matmul(zu_t_1, self.fc1_z) + self.fc1_z_bias) 
+        _z_mean = self.relu(torch.matmul(z_t_1, self.fc1_z) + self.fc1_z_bias) 
         z_mean = torch.matmul(_z_mean.mean(dim = 1), self.fc2_z) + self.fc2_z_bias
         # assemble the actual mean used to sample z_t, which mixes
         # a linear transformation of z_{t-1} with the proposed mean
         # modulated by the gating function
-        z_mean_lin = torch.matmul(zu_t_1, self.fc_z) + self.fc_z_bias
+        z_mean_lin = torch.matmul(z_t_1, self.fc_z) + self.fc_z_bias
         z_loc = (1 - gate) * z_mean_lin.mean(dim = 1)  + gate * z_mean
         # compute the scale used to sample z_t, using the proposed
         # mean from above as input
@@ -92,273 +75,574 @@ class StateTransition(nn.Module):
     """
     Parameterizes the categorical latent transition probability p(s_t |s_{t-1})
     """
-    def __init__(self, S):
+    def __init__(self, S, factor_dim):
         super(StateTransition, self).__init__()
         # linear s transition
         self.fc_s = nn.Linear(S, S)
+        if factor_dim:
+            self.fc1_z = nn.Linear(factor_dim, factor_dim)
+            self.fc2_z = nn.Linear(factor_dim, factor_dim)
+            self.fc3_z = nn.Linear(factor_dim, S)
+            self.relu = nn.PReLU()
         # initialize the activation used in the transition
-        self.softmax = nn.Softmax(dim = 1)
+        self.softmax = nn.Softmax(dim = -1)
 
-    def forward(self, s_t_1):
+    def forward(self, s_t_1, z_t_1):
         """
         Given the latent s_{t-1}, we return the probabilities
         that parameterize the cateorical distribution p(s_t | s_{t-1})
         """
-        s_t = self.softmax(self.fc_s(s_t_1))
+        if z_t_1 is None:
+            s_t = self.softmax(self.fc_s(s_t_1))
+        else:
+            s_t = self.relu(self.fc1_z(z_t_1))
+            s_t = self.relu(self.fc2_z(s_t))
+            s_t = self.softmax(self.fc3_z(s_t))
         return s_t
-
-
-
-class SpatialFactors(nn.Module):
-    """
-    Parameterizes spatial factors  p(F | z_F)
-    """
-    def __init__(self, D, factor_dim, zF_dim):
-        super(SpatialFactors, self).__init__()
-        # initialize the linear transformations used in the neural network
-        # shared structure
-        self.fc1 = nn.Linear(zF_dim, 2*zF_dim)
-        self.fc2 = nn.Linear(2*zF_dim, 4*zF_dim)
-        # mean and sigma for factor location
-        self.fc3 = nn.Linear(4*zF_dim, 2 * D * factor_dim)
-        # initialize the non-linearities used in the neural network
-        self.relu = nn.PReLU()
-        
-    def forward(self, z_F):
-        """
-        Given the latent z_F corresponding to spatial factor embedding
-        we return the mean and sigma vectors that parameterize the
-        (diagonal) gaussian distribution p(F | z_F) for factor location 
-        and scale.
-        """
-        # computations for shared structure 
-        _h = self.relu(self.fc1(z_F))
-        h = self.relu(self.fc2(_h))
-        # compute the 'mean' and 'sigma' for factor location given z_F
-        factor_params = self.fc3(h)
-        # return means, sigmas of factor loc, scale which can be fed into Normal
-        return factor_params[:,:D*factor_dim], factor_params[:,D*factor_dim:]
     
+
+class Emission(nn.Module):
+    def __init__(self, factor_dim, D, factorization):
+        super(Emission, self).__init__()
+        self.factorization = factorization
+        if not factorization:
+            self.fc_1 = nn.Linear(factor_dim, 2*factor_dim)
+            self.fc_2 = nn.Linear(2*factor_dim, 2*factor_dim)
+            self.fc_3 = nn.Linear(2*factor_dim, 2*factor_dim)
+            self.fc_4 = nn.Linear(2*factor_dim, D)
+            self.relu = nn.PReLU()
+        else:
+            self.fc = nn.Linear(factor_dim, D)
+
+    def forward(self, z_t):
+        if not self.factorization:
+            y_t = self.relu(self.fc_1(z_t))
+            y_t = self.relu(self.fc_2(y_t))
+            y_t = self.relu(self.fc_3(y_t))
+            y_t = self.fc_4(y_t)
+        else:
+            y_t = self.fc(z_t)
+        return y_t
+
 
 class Combiner(nn.Module):
     """
-    Parameterizes q(z_t | z_{t-1}, w_{t:T}), which is the basic building block
-    of the guide (i.e. the variational distribution). The dependence on w_{t:T} is
+    Parameterizes q(z_t | z_{t-1}, x_{t:T}), which is the basic building block
+    of the guide (i.e. the variational distribution). The dependence on x_{t:T} is
     through the hidden state of the RNN (see the pytorch module `rnn` below)
     """
-    def __init__(self, z_dim, u_dim, rnn_dim, L):
+    def __init__(self, z_dim, rnn_dim, L):
         super(Combiner, self).__init__()
         # initialize the linear transformations used in the neural network
-        self.fc1_z, self.fc1_z_bias = FC([L, z_dim + u_dim, rnn_dim])
+        self.fc1_z, self.fc1_z_bias = FC([L, z_dim, rnn_dim])
         self.fc2_z = nn.Linear(rnn_dim, z_dim)
+        self.fc21_z = nn.Linear(z_dim, z_dim)
         self.fc3_z = nn.Linear(rnn_dim, z_dim)
+        self.fc31_z = nn.Linear(z_dim, z_dim)
         # initialize the non-linearities used in the neural network
-        self.tanh = nn.Tanh()
+        self.tanh = nn.PReLU()
 
-    def forward(self, z_t_1, u_t_1, h_rnn):
+    def forward(self, z_t_1, h_rnn):
         """
         Given the latent z at at a particular time step t-1 as well as the hidden
-        state of the RNN h(w_{t:T}) we return the mean and scale vectors that
+        state of the RNN h(x_{t:T}) we return the mean and scale vectors that
         parameterize the (diagonal) gaussian distribution q(z_t | z_{t-1}, y_{t:T})
         """
-        # stack z and u in a single vector if u is available
-        if u_t_1 is not None:
-            zu_t_1 = torch.cat((z_t_1, u_t_1), dim = -1)
-        else:
-            zu_t_1 = z_t_1
         # combine the rnn hidden state with a transformed version of z_t_1
-        h = torch.matmul(zu_t_1, self.fc1_z) + self.fc1_z_bias
-        h_combined = 0.5 * (self.tanh(h).mean(dim = 0) + h_rnn)
+        h = torch.matmul(z_t_1, self.fc1_z) + self.fc1_z_bias
+        h_combined = 0.5 * (self.tanh(h).mean(dim = 0) + self.tanh(h_rnn))
         # use the combined hidden state to compute the mean used to sample z_t
-        loc = self.fc2_z(h_combined)
+        loc = self.tanh(self.fc2_z(h_combined))
+        loc = self.fc21_z(loc)
         # use the combined hidden state to compute the scale used to sample z_t
-        scale = self.fc3_z(h_combined)
+        scale = self.tanh(self.fc3_z(h_combined))
+        scale = self.fc31_z(scale)
         # return loc, scale which can be fed into Normal
         return loc, scale
 
+class LSTM_obs(nn.Module):
+    
+    def __init__(self, D, rnn_dim, factor_dim, S):
+        super(LSTM_obs, self).__init__()
+        self.S = S
+        self.rnn = nn.LSTM(D, rnn_dim, 2, batch_first=False,
+                           bidirectional=False)
+        self.fc1_rnn = nn.Linear(rnn_dim, rnn_dim)
+        self.fc2_rnn = nn.Linear(rnn_dim, rnn_dim)
+        self.fc3_rnn = nn.Linear(rnn_dim, factor_dim*2)
+        if S:
+            self.fc1_rnn_s = nn.Linear(rnn_dim, rnn_dim)
+            self.fc2_rnn_s = nn.Linear(rnn_dim, rnn_dim)
+            self.fc3_rnn_s = nn.Linear(rnn_dim, S)
+            
+        self.relu = nn.PReLU()
+    def forward(self, x):
+        rnn_output, _= self.rnn(x)
+        z = self.relu(self.fc1_rnn(rnn_output))
+        z = self.relu(self.fc2_rnn(z))
+        z = self.fc3_rnn(z)
+        s = None
+        if self.S:
+            s = self.relu(self.fc1_rnn_s(rnn_output))
+            s = self.relu(self.fc2_rnn_s(s))
+            s = self.fc3_rnn_s(s).permute(1,0,2)
+            
+        return z, s
+  
+    
+    
+    def __init__(self):
+        super(CNN, self).__init__()
+        #self.rnn = nn.LSTM(factor_dim, d_h, 4, batch_first=True, bidirectional=False) 
+        self.conv1 = nn.Conv1d(factor_dim, 25, 5, 1)
+        self.bn1 = nn.BatchNorm1d(25)
+        self.conv2 = nn.Conv1d(25, 15, 5, 2)
+        self.bn2 = nn.BatchNorm1d(15)
+        self.conv3 = nn.Conv1d(15, 5, 5, 2)
+        self.bn3 = nn.BatchNorm1d(5)
+        self.fc1 = nn.Linear(45, 10)
+        self.fc2 = nn.Linear(10, labels.max().item()+1)
+        self.relu = nn.ReLU()
+    def forward(self, x):
+        # x: N x T x D
+        x = self.relu(self.conv1(x.permute(0,2,1)))
+        x = self.bn1(x)
+        x = self.relu(self.conv2(x))
+        x = self.bn2(x)
+        x = self.relu(self.conv3(x))
+        x = self.bn3(x)
+        x = self.relu(self.fc1(x.reshape(x.shape[0],-1)))
+        x = self.fc2(x)
+        return xz
 
 class DSARF(nn.Module):
     """
     This PyTorch Module encapsulates the model as well as the
     variational distribution for the Deep Markov Factor Analysis
     """
-    def __init__(self, n_data=100, T = 18,  factor_dim=10, z_dim=5,
-                 u_dim=0, transition_dim=5, zF_dim=5, n_class=1,
-                 sigma_obs = 0, rnn_dim = None, rnn_dropout_rate = 0.0,
-                 D = 300, L = None, S = None):
-        super(DSARF, self).__init__()
+    def __init__(self, D, factor_dim, L, S, transition_dim=None,
+                 VI = {'rnn_dim': None, 'combine': False, 'S': False}, recurrent = False,
+                 recursive_state = False,
+                 factorization = True, lr = 1e-2, batch_size = 20):
+        super().__init__()
         
-        self.rnn_dim = rnn_dim
-        # observation noise
-        self.sig_obs = sigma_obs
-        self.L = L
-        self.S = S
+        self.D, self.factor_dim, self.L, self.S = D, factor_dim, L, S
+        transition_dim = [transition_dim if transition_dim is not None else factor_dim][0]
+        self.VI, self.recurrent, self.recursive_state = VI, recurrent, recursive_state
         # instantiate pytorch modules used in the model and guide below
-        self.trans = GatedTransition(z_dim, u_dim, transition_dim, S, len(L))
-        self.strans = StateTransition(S)
-        self.spat = SpatialFactors(D, factor_dim, zF_dim)
+        self.trans = GatedTransition(factor_dim, transition_dim, S, len(L))
+        self.strans = StateTransition(S, [factor_dim if recurrent else 0][0])
         
-        if rnn_dim is not None: # initialize extended DSARF
-            self.combiner = Combiner(z_dim, u_dim, rnn_dim*2, len(L))
-            self.rnn = nn.RNN(input_size=factor_dim, hidden_size=rnn_dim,
-                              nonlinearity='relu', batch_first=True,
-                              bidirectional=True, num_layers=1, dropout=rnn_dropout_rate)
-            # define a (trainable) parameter for the initial hidden state of the rnn
-            self.h_0 = nn.Parameter(torch.zeros(2, 1, rnn_dim))
+        if VI['rnn_dim'] is not None:
+            self.lstm_obs = LSTM_obs(D, VI['rnn_dim'], factor_dim, [S if VI['S'] else 0][0])
+            if VI['combine']:
+                self.combiner = Combiner(factor_dim, factor_dim*2, len(L))
 
-        self.softmax = nn.Softmax(dim = -1)
-        self.p_c = nn.Parameter(torch.ones(1, n_class))
         self.p_s_0 = nn.Parameter(torch.ones(1, S))
+        self.z_0_mu = nn.Parameter(torch.rand(max(L), 1, factor_dim)- 1/2)
+        self.z_0_sig = nn.Parameter((torch.ones(max(L), 1, factor_dim) / 2 * 0.15 * 5).log())
         
-        self.p_z_F_mu = nn.Parameter(torch.zeros(1, zF_dim))
-        self.p_z_F_sig = nn.Parameter(torch.ones(1, zF_dim).log())
-
-        self.z_0_mu = nn.Parameter(torch.rand(max(L), n_class, z_dim)- 1/2)
-        init_sig = (torch.ones(max(L), n_class, z_dim) / (2 * n_class)* 0.15 * 5).log()
-        self.z_0_sig = nn.Parameter(init_sig)
-        
-        self.q_c = torch.ones(n_data, max(L), n_class) / n_class
-        if args.ID == 'apnea':
-            self.q_s = nn.Parameter(torch.ones(n_data, T, S) / S, requires_grad=False)
-        else:
-            self.q_s = torch.ones(n_data, T, S) / S
-        self.q_s_0 = nn.Parameter(torch.ones(n_data, S))
-        
-        self.q_z_0_mu = nn.Parameter(torch.rand(n_data, max(L), z_dim)- 1/2)
-        init_sig = (torch.ones(n_data, max(L), z_dim) / (2 * n_class)*0.1).log()
-        self.q_z_0_sig = nn.Parameter(init_sig)
-        if rnn_dim is not None:
-            self.q_z_mu = torch.zeros(n_data, T, z_dim)
-            self.q_z_sig = torch.ones(n_data, T, z_dim)
-        else:
-            self.q_z_mu = nn.Parameter(torch.rand(n_data, T, z_dim)- 1/2)
-            init_sig = (torch.ones(n_data, T, z_dim) / (2 * n_class) * 0.1).log()
-            self.q_z_sig = nn.Parameter(init_sig)
-        self.q_z_F_mu = nn.Parameter(torch.zeros(1, zF_dim))
-        init_sig = torch.ones(1, zF_dim).log()
-        self.q_z_F_sig = nn.Parameter(init_sig)
-        self.q_F_loc_mu = nn.Parameter(torch.rand(factor_dim, D)- 1/2)
-        init_sig = (torch.ones(factor_dim, D) / (2 * factor_dim) * 0.1).log()
-        self.q_F_loc_sig = nn.Parameter(init_sig)
-                  
-    def Reparam(self, mu_latent, sigma_latent):
-        eps = Variable(mu_latent.data.new(mu_latent.size()).normal_())
-        return eps.mul(sigma_latent.exp()).add_(mu_latent)
+        #self.q_F_loc_mu = nn.Parameter(torch.rand(1, factor_dim, D)- 1/2)
+        self.emission = Emission(factor_dim, D, factorization)
+        self.mean, self.std, self.grad = 0, 1, True
+        self.lr, self.batch_size = lr, batch_size
     
-    # the model p(y|w,F)p(w|z)p(z_t|z_{t-1},u_{t-1})p(z_0|c)p(c)p(F|z_F)p(z_F)
-    def forward(self, mini_batch, u_values, mini_batch_idxs):
-        # u_values = (data_points, time_points, u_dim)
-        # z_values = (data_points, time_points + max(L), z_dim)
-        # F_loc_values = (factor_dim, D)
-        N = mini_batch.size(0)
-        T_b = mini_batch.size(1)
-        z_dim = self.q_z_0_mu.size(-1)
-        n_class = self.z_0_mu.size(1)
+    def fit(self, data, epoch_num = 500):
         
-        q_z_0_mus = self.q_z_0_mu[mini_batch_idxs] #batch*L*z_dim
-        q_z_0_sigs = self.q_z_0_sig[mini_batch_idxs] #batch*L*z_dim
-        z_0_values = self.Reparam(q_z_0_mus, q_z_0_sigs)
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        print('Using device:', device)
+        if self.grad:
+            data_st_cat = np.concatenate(data, axis = 0)
+            self.mean = data_st_cat[~np.isnan(data_st_cat)].mean()
+            self.std = data_st_cat[~np.isnan(data_st_cat)].std()
         
-        if self.rnn_dim is not None:
-            q_z_mus = torch.Tensor([]).reshape(N, 0, z_dim)
-            q_z_sigs = torch.Tensor([]).reshape(N, 0, z_dim)
-            h_0_contig = self.h_0.expand(2, T_b,
-                                         self.rnn.hidden_size).contiguous()
-            rnn_output, _= self.rnn(mini_batch.permute(1,0,2), h_0_contig)
-            z_values = z_0_values.clone()
-            z_prev = z_values.permute(1,0,2)[-np.array(self.L)]
-            for i in range(T_b):
-                if u_values is not None and max(self.L) == 1:
-                    u_prev = u_values[:,i,:].unsqueeze(0)
-                else:
-                    u_prev = None
-                loc, scale = self.combiner(z_prev, u_prev, rnn_output[i])
-                z_val = self.Reparam(loc, scale)
-                z_values = torch.cat((z_values,z_val.unsqueeze(1)), dim=1)
-                z_prev = z_values.permute(1,0,2)[-np.array(self.L)]
-                q_z_mus = torch.cat((q_z_mus,loc.unsqueeze(1)), dim=1)
-                q_z_sigs = torch.cat((q_z_sigs,scale.unsqueeze(1)), dim=1)            
-            self.q_z_mu[mini_batch_idxs, :T_b] = q_z_mus
-            self.q_z_sig[mini_batch_idxs, :T_b] = q_z_sigs
-        else:
-            q_z_mus = self.q_z_mu[mini_batch_idxs, :T_b] #batch*T*z_dim
-            q_z_sigs = self.q_z_sig[mini_batch_idxs, :T_b] #batch*T*z_dim
-            z_t_values = self.Reparam(q_z_mus, q_z_sigs)
-            z_values = torch.cat((z_0_values, z_t_values), dim = 1)   
-              
-        # p(z_t|z_{t-1},u{t-1}, s_t) = Normal(z_loc, z_scale)
-        z_t_1 = torch.Tensor([]).reshape(0, N * T_b, z_dim)
-        for lag in self.L:
-            z_t_1 = torch.cat((z_t_1,
-                               z_values[:, max(self.L)-lag:-lag].reshape(1, -1, z_dim)),
-                              dim = 0)
-        if u_values is not None and max(self.L) == 1:
-            u_t_1 = u_values.reshape(1, N * T_b, -1)
-        else:
-            u_t_1 = None
-        p_z_mu, p_z_sig = self.trans(z_t_1, u_t_1)
-        p_z_mu = p_z_mu.view(self.S, N, T_b, -1)
-        p_z_sig = p_z_sig.view(self.S, N, T_b, -1)
+        dataa_train = [(data[i] - self.mean)/self.std for i in range(len(data))]
         
-        # compute q(s_0)
-        p_s_0 = self.softmax(self.p_s_0)
-        q_s_0 = self.softmax(self.q_s_0[mini_batch_idxs])
-        # compute q(s_t) = p(s_t|z_t) = p(z_t|z_{t-1},s_t)p(s_t|s_{t-1})
-        q_s_t = self.q_s[mini_batch_idxs, :T_b]
-        q_s = torch.cat((q_s_0.unsqueeze(1), q_s_t), dim=1)
-        p_s_t = self.strans(q_s[:,:-1].reshape(N*T_b, -1)).reshape(N, T_b, -1)
-        z_t_vals = z_values[:, max(self.L):] # batch*T_b*z_dim
-        # compute q(s_t)
-        q_s_t = p_s_t.permute(2, 0, 1).log()\
-              -1/2*((z_t_vals - p_z_mu)\
-              /(p_z_sig.exp()+1e-4)).pow(2).sum(dim = -1)\
-              -p_z_sig.sum(dim = -1)
-        q_s_t = self.softmax(q_s_t.permute(1, 2, 0))
-        self.q_s[mini_batch_idxs, :T_b] = q_s_t.detach()
-        if self.S == 1:
-            q_s_t = torch.ones(N, T_b, 1)
+        # set parameters 
+        n_data = len(dataa_train)
+        lens = [len(i) for i in dataa_train]
+        #form data for training
+        training_set_part = [(torch.FloatTensor(y),torch.LongTensor([i])) for i, y in enumerate(dataa_train)]
+    
+        # initialize model
+        for p in self.parameters(): #turn gradients on/off
+            p.requires_grad  = self.grad
+        dsarf = self.DSARF_(self, n_data, lens).to(device)
         
-        z_0_vals = z_0_values.repeat(1, 1, n_class).view(N, -1, n_class, z_dim)
-        q_c = self.softmax(self.p_c).log()\
-              -1/2*((z_0_vals - self.z_0_mu)\
-              /(self.z_0_sig.exp()+1e-4)).pow(2).sum(dim = -1)\
-              -self.z_0_sig.sum(dim = -1)
-        q_c = self.softmax(q_c)
-        self.q_c[mini_batch_idxs] = q_c.detach()
-
-        F_loc_values = self.Reparam(self.q_F_loc_mu,
-                                     self.q_F_loc_sig)
-        zF_value = self.Reparam(self.q_z_F_mu,
-                                 self.q_z_F_sig)
+        optim_dsarf = optim.Adam(dsarf.parameters(), lr = self.lr)
+        # number of parameters  
+        total_params = sum(p.numel() for p in dsarf.parameters())
+        learnable_params = sum(p.numel() for p in dsarf.parameters() if p.requires_grad)
+        print('Total Number of Parameters: %d' % total_params)
+        print('Learnable Parameters: %d' %learnable_params)
         
-        # p(F_mu|z_F) = Normal(F_mu_loc, F_mu_scale)
-        p_F_loc_mu, p_F_loc_sig = self.spat(zF_value)
-        p_F_loc_mu = p_F_loc_mu.view(factor_dim, -1)
-        p_F_loc_sig = p_F_loc_sig.view(factor_dim, -1)
+        params = {'batch_size': self.batch_size,
+                  'shuffle': True,
+                  'num_workers': 0}
+        train_loader = DataLoader(training_set_part, **params)
         
-        # p(y|z,F) = Normal(z*F, sigma)
-        # z : (data_points, time_points, factor_dim)
-        # F: (data_points, factor_dim, voxel_num)
-        y_hat_nn = torch.matmul(z_values[:, max(self.L):],
-                                F_loc_values)
-        obs_noise = y_hat_nn.data.new(y_hat_nn.size()).normal_()
-        y_hat = obs_noise.mul(self.sig_obs).add_(y_hat_nn)
-        
-        q_z_0_mus.unsqueeze_(2)
-        q_z_0_sigs.unsqueeze_(2)
-        
-        return y_hat,\
-                q_c, self.p_c,\
+        for i in tqdm(range(epoch_num)):
+            #time_start = time.time()
+            loss_value = 0.0
+            for batch_indx, batch_data in enumerate(train_loader):
+            # update DSARF
+                mini_batch, mini_batch_idxs = batch_data
+                mini_batch_idxs = mini_batch_idxs.reshape(-1)
+                mini_batch = mini_batch.to(device)
+                mini_batch_idxs = mini_batch_idxs.to(device)
+    
+                y_hat,\
                 q_s_0, p_s_0,\
                 q_s_t, p_s_t,\
                 q_z_0_mus, q_z_0_sigs,\
-                self.z_0_mu, self.z_0_sig,\
+                z_0_mu, z_0_sig,\
                 q_z_mus, q_z_sigs,\
-                p_z_mu, p_z_sig,\
-                self.q_F_loc_mu, self.q_F_loc_sig,\
-                p_F_loc_mu, p_F_loc_sig,\
-                self.q_z_F_mu, self.q_z_F_sig,\
-                self.p_z_F_mu, self.p_z_F_sig
+                p_z_mu, p_z_sig\
+                = dsarf.forward(mini_batch, mini_batch_idxs)
+    
+                # set gradients to zero in each iteration
+                optim_dsarf.zero_grad()
+            
+                # computing loss
+                idxs_nonnan = ~torch.isnan(mini_batch)
+                annealing_factor = 0.001
+                
+                loss_dsarf = ELBO_Loss(mini_batch[idxs_nonnan],
+                                      y_hat[idxs_nonnan],
+                                      q_s_0, p_s_0,
+                                      q_s_t[:, max(self.L):], p_s_t[:, max(self.L):],
+                                      q_z_0_mus, q_z_0_sigs,
+                                      z_0_mu, z_0_sig,
+                                      q_z_mus[:, max(self.L):], q_z_sigs[:, max(self.L):],
+                                      p_z_mu[:,:, max(self.L):], p_z_sig[:,:, max(self.L):],
+                                      annealing_factor)
+                
+                # back propagation
+                loss_dsarf.backward()
+                # update parameters
+                optim_dsarf.step()
+                # accumulate loss  
+                loss_value += loss_dsarf.item()
+            
+            #time_end = time.time()
+            #print('elapsed time (min) : %0.1f' % ((time_end-time_start)/60))
+            if (i % 50 == 0) or (i == epoch_num - 1):
+                NRMSE = dsarf.report_stats(data)
+                epoch = i + 1
+                
+            print('ELBO_Loss: %0.4f, Epoch %d: {NRMSE_recv : %0.2f, NRMSE_pred : %0.2f}'
+                  % (loss_value / len(train_loader.dataset),
+                     epoch, NRMSE['NRMSE_recv'], NRMSE['NRMSE_pred']),
+                  end="\r", flush=True)
+            #torch.save(dsarf.state_dict(), PATH_DSARF)
+        return dsarf
+        
+    def infer(self, data, epoch_num = 500):
+        self.grad = False
+        if self.VI['rnn_dim'] is not None:
+            epoch_num = 1
+        dsarf = self.fit(data, epoch_num)
+        self.grad = True
+        return dsarf
+         
+    class DSARF_(nn.Module):
+        def __init__(self, dsarf, n_data, lens):
+            super().__init__()
+            
+            self.dsarf = dsarf
+            self.lens = lens
+            T = max(lens) # use maximum T to conveniently support varying length
+            self.softmax = nn.Softmax(dim = -1)
+            self.q_s = nn.Parameter(torch.ones(n_data, T, dsarf.S) / dsarf.S, requires_grad=False)
+            self.q_s_0 = nn.Parameter(torch.ones(n_data, dsarf.S))
+            
+            self.q_z_0_mu = nn.Parameter(torch.rand(n_data, max(dsarf.L), dsarf.factor_dim)- 1/2)
+            self.q_z_0_sig = nn.Parameter((torch.ones(n_data, max(dsarf.L), dsarf.factor_dim) / 2 * 0.1).log())
+            
+            self.q_z_mu = nn.Parameter(torch.rand(n_data, T, dsarf.factor_dim)- 1/2)
+            self.q_z_sig = nn.Parameter((torch.ones(n_data, T, dsarf.factor_dim) / 2 * 0.1).log())
+            if dsarf.VI['rnn_dim'] is not None: 
+                self.q_z_mu.requires_grad, self.q_z_sig.requires_grad = False, False
+    
+        def Reparam(self, mu_latent, sigma_latent):
+            eps = mu_latent.data.new(mu_latent.size()).normal_()
+            return eps.mul(sigma_latent.exp()).add_(mu_latent)
+        
+        # the model p(y|w,F)p(w|z)p(z_t|z_{t-1},u_{t-1})p(z_0|c)p(c)p(F|z_F)p(z_F)
+        def forward(self, mini_batch, mini_batch_idxs):
+            # z_values = (data_points, time_points + max(L), z_dim)
+            # F_loc_values = (factor_dim, D)
+            N = mini_batch.size(0)
+            T_b = mini_batch.size(1)
+            z_dim = self.q_z_0_mu.size(-1)
+            
+            q_z_0_mus = self.q_z_0_mu[mini_batch_idxs] #batch*L*z_dim
+            q_z_0_sigs = self.q_z_0_sig[mini_batch_idxs] #batch*L*z_dim
+            z_0_values = self.Reparam(q_z_0_mus, q_z_0_sigs)
+            
+            if self.dsarf.VI['rnn_dim'] is not None:
+                
+                y_filled = self.dsarf.emission(self.q_z_mu[mini_batch_idxs, :T_b])
+                idxs_nans = torch.isnan(mini_batch)
+                obs = torch.zeros_like(mini_batch)
+                obs[~idxs_nans] = mini_batch[~idxs_nans] * 1.0
+                obs[idxs_nans] = y_filled[idxs_nans].data * 1.0
+
+                rnn_output, q_s_t = self.dsarf.lstm_obs(obs.permute(1,0,2))
+                
+                if self.dsarf.VI['combine']:
+                    q_z_mus = torch.Tensor([]).reshape(N, 0, z_dim).to(rnn_output.device)
+                    q_z_sigs = torch.Tensor([]).reshape(N, 0, z_dim).to(rnn_output.device)
+                    z_values = z_0_values.clone()
+                    z_prev = z_values.permute(1,0,2)[-np.array(self.dsarf.L)]
+                    for i in range(T_b):
+                        loc, scale = self.dsarf.combiner(z_prev, rnn_output[i])
+                        z_val = self.Reparam(loc, scale)
+                        z_values = torch.cat((z_values,z_val.unsqueeze(1)), dim=1)
+                        z_prev = z_values.permute(1,0,2)[-np.array(self.dsarf.L)]
+                        q_z_mus = torch.cat((q_z_mus,loc.unsqueeze(1)), dim=1)
+                        q_z_sigs = torch.cat((q_z_sigs,scale.unsqueeze(1)), dim=1) 
+                else:
+                    q_z_mus = rnn_output.permute(1,0,2)[:,:,:z_dim] #batch*T*z_dim
+                    q_z_sigs = rnn_output.permute(1,0,2)[:,:,z_dim:] #batch*T*z_dim
+                    z_t_values = self.Reparam(q_z_mus, q_z_sigs)
+                    z_values = torch.cat((z_0_values, z_t_values), dim = 1) 
+                self.q_z_mu[mini_batch_idxs, :T_b] = q_z_mus.detach()
+                self.q_z_sig[mini_batch_idxs, :T_b] = q_z_sigs.detach()
+            else:
+                q_z_mus = self.q_z_mu[mini_batch_idxs, :T_b] #batch*T*z_dim
+                q_z_sigs = self.q_z_sig[mini_batch_idxs, :T_b] #batch*T*z_dim
+                z_t_values = self.Reparam(q_z_mus, q_z_sigs)
+                z_values = torch.cat((z_0_values, z_t_values), dim = 1)   
+                  
+            # p(z_t|z_{t-1},u{t-1}, s_t) = Normal(z_loc, z_scale)
+            z_t_1 = torch.Tensor([]).reshape(0, N * T_b, z_dim).to(z_values.device)
+            for lag in self.dsarf.L:
+                z_t_1 = torch.cat((z_t_1,
+                                   z_values[:, max(self.dsarf.L)-lag:-lag].reshape(1, -1, z_dim)),
+                                  dim = 0)
+
+            p_z_mu, p_z_sig = self.dsarf.trans(z_t_1)
+            p_z_mu = p_z_mu.view(self.dsarf.S, N, T_b, -1)
+            p_z_sig = p_z_sig.view(self.dsarf.S, N, T_b, -1)
+            
+            # compute q(s_0)
+            p_s_0 = self.softmax(self.dsarf.p_s_0)
+            q_s_0 = self.softmax(self.q_s_0[mini_batch_idxs])
+            # compute q(s_t) = p(s_t|z_t) = p(z_t|z_{t-1},s_t)p(s_t|s_{t-1})
+            if not self.dsarf.VI['S']:
+                q_s_t = self.q_s[mini_batch_idxs, :T_b]
+            else:
+                #krnl = 5
+                #q_s_t = torch.cat((q_s_t, q_s_t[:,-1:].repeat(1, krnl-1, 1)), 1).unfold(1, krnl, 1).mean(-1)
+                q_s_t = self.softmax(q_s_t)
+            q_s = torch.cat((q_s_0.unsqueeze(1), q_s_t), dim=1)
+            p_s_t = self.dsarf.strans(q_s[:,:-1],
+                                [z_values[:,max(self.dsarf.L)-1:-1]
+                                 if self.dsarf.recurrent else None][0])
+            z_t_vals = z_values[:, max(self.dsarf.L):] # batch*T_b*z_dim
+            
+            # p(y|z,F) = Normal(z*F, sigma)
+
+            y_hat = self.dsarf.emission(z_values[:, max(self.dsarf.L):]) # S*N*T*D
+            
+            # compute q(s_t)
+            if not self.dsarf.VI['S']:
+                if not self.dsarf.recursive_state:
+                    q_s_t = (p_s_t.permute(2, 0, 1)+1e-4).log()\
+                              -1/2*((z_t_vals - p_z_mu)\
+                              /(p_z_sig.exp()+1e-4)).pow(2).sum(dim = -1)\
+                              -p_z_sig.sum(dim = -1)  # n*T*K, S*n*T*K = S*n*T
+                    #krnl = 5
+                    q_s_t = q_s_t.permute(1, 2, 0)
+                    #q_s_t = torch.cat((q_s_t, q_s_t[:,-1:].repeat(1, krnl-1, 1)), 1).unfold(1, krnl, 1).mean(-1)
+                    q_s_t = self.softmax(q_s_t)
+            
+                else:
+                    # compute q(s_t) = p(s_t|z_t) = p(z_t|z_{t-1},s_t)p(s_t|s_{t-1})
+                    p_s_t = torch.Tensor([]).reshape(N, 0, self.dsarf.S)
+                    q_s_t = torch.Tensor([]).reshape(N, 0, self.dsarf.S)
+                    s_t_1 = q_s_0.clone()
+                    for i in range(T_b):
+                        # p(s_t|s_{t-1})
+                        p_s = self.dsarf.strans(s_t_1,
+                                          [z_values[:,i+max(self.dsarf.L)-1]
+                                           if self.dsarf.recurrent else None][0]) # batch*S
+                        p_s_t = torch.cat((p_s_t, p_s.unsqueeze(1)), dim = 1)
+                        z_t_vals = z_values[:, i + max(self.dsarf.L)] # batch*z_dim
+                        # compute q(s_t)
+                        q_s = (p_s.permute(1, 0)+1e-4).log()\
+                              -1/2*((z_t_vals - p_z_mu[:,:,i])\
+                              /(p_z_sig[:,:,i].exp()+1e-4)).pow(2).sum(dim = -1)\
+                              -p_z_sig[:,:,i].sum(dim = -1)
+                        s_t_1 = self.softmax(q_s.permute(1, 0))
+                        q_s_t = torch.cat((q_s_t, s_t_1.unsqueeze(1)), dim = 1)
+    
+            self.q_s[mini_batch_idxs, :T_b] = q_s_t.detach()
+            if self.dsarf.S == 1:
+                q_s_t = torch.ones(N, T_b, 1).to(y_hat.device)
+            
+            q_z_0_mus.unsqueeze_(2)
+            q_z_0_sigs.unsqueeze_(2)
+            
+            return y_hat,\
+                    q_s_0, p_s_0,\
+                    q_s_t, p_s_t,\
+                    q_z_0_mus, q_z_0_sigs,\
+                    self.dsarf.z_0_mu, self.dsarf.z_0_sig,\
+                    q_z_mus, q_z_sigs,\
+                    p_z_mu, p_z_sig
+                    
+        def report_stats(self, data):
+            
+            y_recv = self.dsarf.emission(self.q_z_mu).detach().cpu().numpy()*self.dsarf.std + self.dsarf.mean
+            y_pred , _, _ = self.short_predict()
+            
+            NRMSE = [compute_NRMSE(data, y_recv), compute_NRMSE(data, y_pred)]
+            NRMSE = dict(zip(['NRMSE_recv','NRMSE_pred'], NRMSE))
+            return NRMSE
+            
+        
+        def short_predict(self, s=None):
+            
+            N, T_b, z_dim = self.q_z_mu.shape
+            # p(z_t|z_{t-1}, s_t) = Normal(z_loc, z_scale)
+            z_t_1 = torch.Tensor([]).reshape(0, N * (T_b-max(self.dsarf.L)), z_dim).to(self.q_z_mu.device)
+            for lag in self.dsarf.L:
+                z_t_1 = torch.cat((z_t_1,
+                                   self.q_z_mu[:, max(self.dsarf.L)-lag:-lag].reshape(1, -1, z_dim)),
+                                  dim = 0)
+            p_z_mu, p_z_sig = self.dsarf.trans(z_t_1)
+            p_z_mu = p_z_mu.view(self.dsarf.S, N, T_b-max(self.dsarf.L), -1)
+            p_z_sig = p_z_sig.view(self.dsarf.S, N, T_b-max(self.dsarf.L), -1)
+            if s is not None:
+                p_z_mu = p_z_mu[[s]]
+                p_z_sig = p_z_sig[[s]]
+            p_s_t = self.dsarf.strans(self.q_s[:,max(self.dsarf.L)-1:-1],
+                                [self.q_z_mu[:,max(self.dsarf.L)-1:-1]
+                                 if self.dsarf.recurrent else None][0])
+            
+            z_val_p = torch.cat(((self.q_z_mu+self.q_z_sig.exp())[:,:max(self.dsarf.L)],
+                                 (p_s_t.permute(2,0,1).unsqueeze(-1) * (p_z_mu+p_z_sig.exp())).sum(dim=0)), dim=1)
+            z_val_n = torch.cat(((self.q_z_mu-self.q_z_sig.exp())[:,:max(self.dsarf.L)],
+                                 (p_s_t.permute(2,0,1).unsqueeze(-1) * (p_z_mu-p_z_sig.exp())).sum(dim=0)), dim=1)
+            z_val = torch.cat((self.q_z_mu[:,:max(self.dsarf.L)],
+                               (p_s_t.permute(2,0,1).unsqueeze(-1) * p_z_mu).sum(dim=0)), dim=1)
+            
+            y_pred_n = self.dsarf.emission(z_val_n).detach().cpu().numpy()*self.dsarf.std+self.dsarf.mean 
+            y_pred_n = [j[:self.lens[i]] for i, j in enumerate(y_pred_n)]
+            y_pred_p = self.dsarf.emission(z_val_p).detach().cpu().numpy()*self.dsarf.std+self.dsarf.mean 
+            y_pred_p = [j[:self.lens[i]] for i, j in enumerate(y_pred_p)]
+            y_pred = self.dsarf.emission(z_val).detach().cpu().numpy()*self.dsarf.std+self.dsarf.mean 
+            y_pred = [j[:self.lens[i]] for i, j in enumerate(y_pred)]
+            return y_pred, y_pred_n, y_pred_p
+        
+        
+
+        def long_predict(self, steps, s = None):
+            
+            z_values = z_values_p = z_values_n = self.q_z_mu[:,-max(self.dsarf.L):]
+            z_t_1 = z_values.permute(1,0,2)[-np.array(self.dsarf.L)]
+            z_t_1_s = z_values.permute(1,0,2)[-1]
+    
+            s_vals = self.q_s[:,-max(self.dsarf.L):]
+            s_t_1 = self.q_s[:, -1]
+            for i in range(steps):
+                p_z_mu, p_z_sig = self.dsarf.trans(z_t_1) # S*N*z_dim
+                p_s = self.dsarf.strans(s_t_1,
+                                        [z_t_1_s if self.dsarf.recurrent else None][0]) # N * S
+                if s is not None:
+                    z_val = p_z_mu[s]
+                    z_val_p = p_z_mu[s]+p_z_sig[s].exp()
+                    z_val_n = p_z_mu[s]-p_z_sig[s].exp()
+                else:
+                    z_val = (p_s.permute(1,0).unsqueeze(-1) * p_z_mu).sum(0)
+                    z_val_p = (p_s.permute(1,0).unsqueeze(-1) * (p_z_mu+p_z_sig.exp())).sum(0)
+                    z_val_n = (p_s.permute(1,0).unsqueeze(-1) * (p_z_mu-p_z_sig.exp())).sum(0)
+                z_values = torch.cat((z_values, z_val.unsqueeze(1)), dim = 1)
+                z_values_p = torch.cat((z_values_p, z_val_p.unsqueeze(1)), dim = 1)
+                z_values_n = torch.cat((z_values_n, z_val_n.unsqueeze(1)), dim = 1)
+                z_t_1 = z_values.permute(1,0,2)[-np.array(self.dsarf.L)]
+                z_t_1_s = z_values.permute(1,0,2)[-1]
+                s_vals = torch.cat((s_vals, p_s.unsqueeze(1)), dim = 1)
+                s_t_1 = p_s * 1.0
+                
+            y_pred_n = self.dsarf.emission(z_values_n[:, max(self.dsarf.L):]).detach().cpu().numpy()*self.dsarf.std+self.dsarf.mean 
+            y_pred_n = [j[:self.lens[i]] for i, j in enumerate(y_pred_n)]
+            y_pred_p = self.dsarf.emission(z_values_p[:, max(self.dsarf.L):]).detach().cpu().numpy()*self.dsarf.std+self.dsarf.mean 
+            y_pred_p = [j[:self.lens[i]] for i, j in enumerate(y_pred_p)]
+            y_pred = self.dsarf.emission(z_values[:, max(self.dsarf.L):]).detach().cpu().numpy()*self.dsarf.std+self.dsarf.mean 
+            y_pred = [j[:self.lens[i]] for i, j in enumerate(y_pred)]
+                
+             
+            return y_pred, y_pred_n, y_pred_p
+
+
+            
+        def plot_predict(self, data, steps = None, path = './plots/'):
+            if not os.path.exists(path):
+                os.makedirs(path)
+            if steps is None:
+                y_pred, y_pred_n, y_pred_p = self.short_predict()
+            else:
+                y_pred, y_pred_n, y_pred_p = self.long_predict(steps)
+            for j in range(0 , len(y_pred), max(len(y_pred)//4, 1)):
+                idx_locs = [i for i in range(0, self.dsarf.D, max(self.dsarf.D//5, 1))]
+                fig = plt.figure(figsize=(10,7/3*len(idx_locs)))
+                for i, idx_loc in enumerate(idx_locs):
+                    ax = fig.add_subplot(len(idx_locs),1,i+1)
+                    ax.plot(data[j][:,idx_loc], label = "Actual")
+                    y_preds_p = y_pred_p[j][:, idx_loc]
+                    y_preds_n = y_pred_n[j][:,idx_loc]
+                    y_preds = y_pred[j][:, idx_loc]
+                    ax.plot(y_preds, 'r-.', label = "Predicted", alpha = 0.8)
+                    ax.fill_between(np.arange(len(y_preds)), y_preds_n, y_preds_p, color = 'red', alpha=0.1)
+                    ax.legend(framealpha = 0, fontsize=13)
+                    ax.set_ylabel('loc #%d' %idx_loc, fontsize=13)
+                    ax.set_xlabel('Time', fontsize=13)
+                plt.tight_layout()
+                plt.show()
+                fig.savefig(path + "prediction_%d.png" %j, bbox_inches='tight')
+                plt.close()
+
+        def plot_states(self, index = None, k_smooth = None, path = './plots/'):
+            if not os.path.exists(path):
+                os.makedirs(path)        
+            import seaborn as sns
+            sns.set_style("white")
+            sns.set_context("talk")
+            color_names = ["windows blue","red","amber","faded green","dusty purple",
+                           "orange","clay","pink","greyish","mint","cyan",
+                           "steel blue","forest green","pastel purple",
+                           "salmon","dark brown","fuchsia","crimson",
+                           "chocolate","lime"]
+            colors = sns.xkcd_palette(color_names)
+            from matplotlib.colors import ListedColormap
+            cmap_limited = ListedColormap(colors[:self.dsarf.S])
+            s_vals = self.q_s.argmax(-1).detach().cpu().numpy().astype('float')
+            if index is None:
+                idxs = [i for i in range(0, len(s_vals), max(len(s_vals)//10,1))]
+            else:
+                idxs = [index]
+            for idx in idxs:
+                s_vals[idx, self.lens[idx]:] = np.nan
+            if k_smooth is not None:
+                from scipy.signal import medfilt
+                s_vals = medfilt(s_vals, [1, k_smooth])
+            fig = plt.figure()
+            ax = fig.add_subplot(111)
+            ax.imshow(s_vals[idxs], aspect='auto', cmap=cmap_limited)
+            ax.set_yticks([])
+            ax.tick_params(axis='both', which='major', labelsize=21)
+            ax.spines['top'].set_visible(False)
+            ax.spines['right'].set_visible(False)
+            ax.set_xlabel('Time', fontsize=21)
+            ax.set_ylabel('Sample', fontsize=21)
+            plt.show()
+            fig.savefig(path+'States.png', bbox_inches='tight')
+
+
+                   
 #batch*L*n_class, 1*n_class               
 #batch*S, 1*S
 # batch*T*S
@@ -383,422 +667,54 @@ def KLD_Cat(q, p):
     KLD = q * ((q+1e-4) / (p+1e-4)).log()
     return KLD.sum(dim = -1)
 
-mse_loss = torch.nn.MSELoss(size_average=False, reduce=True)
 
 def ELBO_Loss(mini_batch, y_hat,\
-              q_c, p_c,\
               q_s_0, p_s_0,\
               q_s_t, p_s_t,\
               q_z_0_mus, q_z_0_sigs,\
               z_0_mu, z_0_sig,\
               q_z_mus, q_z_sigs,\
               p_z_mu, p_z_sig,\
-              q_F_loc_mu, q_F_loc_sig,\
-              p_F_loc_mu, p_F_loc_sig,\
-              q_z_F_mu, q_z_F_sig,\
-              p_z_F_mu, p_z_F_sig,\
               annealing_factor = 1):
     
-    rec_loss = mse_loss(y_hat, mini_batch)
+    # y_hat: S*N*T*D, mini_batch = N*T*D
+    rec_loss = (y_hat - mini_batch).pow(2).sum()
+
     KL_s_0 = KLD_Cat(q_s_0.mean(dim=0), p_s_0).sum()
     KL_s_t = KLD_Cat(q_s_t, p_s_t).sum()
-    if S == 1:
-        KL_s_t = 0
-    KL_z_0 = (q_c *
-                KLD_Gaussian(q_z_0_mus, q_z_0_sigs,
-                             z_0_mu, z_0_sig)).sum()
+    KL_z_0 = KLD_Gaussian(q_z_0_mus, q_z_0_sigs,
+                             z_0_mu, z_0_sig).sum()
     KL_z = (q_s_t.permute(2,0,1) *
                   KLD_Gaussian(q_z_mus, q_z_sigs, 
                                p_z_mu, p_z_sig)).sum()
-    KL_F_loc = KLD_Gaussian(q_F_loc_mu, q_F_loc_sig,
-                            p_F_loc_mu, p_F_loc_sig).sum()
-    KL_z_F = KLD_Gaussian(q_z_F_mu, q_z_F_sig,
-                          p_z_F_mu, p_z_F_sig).sum()
 
-    return rec_loss + annealing_factor * (KL_s_0 + KL_s_t
-                                          + KL_z_0 + KL_z
-                                          + KL_F_loc + KL_z_F)
-
-
-# parse command-line arguments and execute the main method
-if __name__ == '__main__':
-        
-    parser = argparse.ArgumentParser(description="parse args")
-    parser.add_argument('-k', '--factor_dim', type=int, default=100)
-    parser.add_argument('-dt', '--transition_dim', type=int, default=100)
-    parser.add_argument('-du', '--u_dim', type=int, default=0)
-    parser.add_argument('-dzf', '--zF_dim', type=int, default=2)
-    parser.add_argument('-c', '--n_class', type=int, default=1)
-    parser.add_argument('-s', '--n_state', type=int, default=1)
-    parser.add_argument('-lag', nargs='+', type=int, default=1)
-    parser.add_argument('-so', '--sigma_obs', type=float, default=0)
-    parser.add_argument('-restore', action="store_true", default=False)
-    parser.add_argument('-resume', action="store_true", default=False)
-    parser.add_argument('-predict', action="store_true", default=False)
-    parser.add_argument('-strain', action="store_false", default=True,
-                        help = "whether to save train results every 50 epochs")
-    parser.add_argument('-epoch', type=int, default=500)
-    parser.add_argument('-bs', '--batch_size', type=int, default=20)
-    parser.add_argument('-last', type=int, default=1)
-    parser.add_argument('-long', action="store_true", default=False)
-    parser.add_argument('-ID', type=str, default=None)
-    parser.add_argument('-lr', type=float, default=1e-2)
-    parser.add_argument('-drnn', '--rnn_dim', type=int, default=None)
-    parser.add_argument('-file', '--data_file', type=str, default='./data_traffic/tensor.mat')
-    parser.add_argument('-smod', '--model_path', type=str, default='./ckpt_files/')
-    parser.add_argument('-dpath', '--dump_path', type=str, default='./')
-    args = parser.parse_args()
-
-    'Code starts Here'
-    # we have N number of data points each of size (T*D)
-    # we have N number of u each of size (T*u_dim)
-    # we specify a vector with values 0, 1, ..., N-1
-    # each datapoint for shuffling is a tuple ((T*D), (T*u_dim), n)
     
-    if args.long:
-        if args.ID == 'pacific':
-            from plot_results_pacific_long_term import plot_result
-        else:
-            from plot_results_long_term import plot_result
-    else:
-        if args.ID == 'apnea':
-            from plot_results_apnea import plot_result  
-        elif args.ID == 'pacific':
-            from plot_results_pacific_short_term import plot_result 
-        else:
-            from plot_results_short_term import plot_result
-    # setting hyperparametrs
-    
-    factor_dim = args.factor_dim # number of Gaussian blobs (spatial factors)
-    u_dim = args.u_dim # dimension of stimuli embedding
-    zF_dim = args.zF_dim # dimension of spatial factor embedding
-    n_class = args.n_class # number of major clusters
-    S = args.n_state
-    sigma_obs = args.sigma_obs # standard deviation of observation noise
-    T_A = 100 # annealing iterations <= epoch_num
-    Restore = args.restore # set to True if already trained
-    predict = args.predict
-    load_model = args.resume
-    batch_size = args.batch_size # batch size
-    epoch_num = args.epoch # number of epochs
-    num_workers = 0 # number of workers to process dataset
-    lr = args.lr # learning rate for adam optimizer
-    z_dim = args.factor_dim # dimension of temporal latent variable z
-    if args.ID == 'flu' and args.long:
-        transition_dim = 2
-    else:
-        transition_dim = args.factor_dim # hidden units from z_{t-1} to z_t
-    if args.rnn_dim is not None: # whether to add rnn extension to files/folders
-        rnn_ext = '_rnn'
-    else:
-        rnn_ext = ''
-    # dataset parameters
-    root_dir = args.data_file
-    # Path parameters
-    save_PATH = args.model_path
-    if not os.path.exists(save_PATH):
-        os.makedirs(save_PATH)
-    fig_PATH = args.dump_path + 'fig_files%s/' %(rnn_ext)
-    if not os.path.exists(fig_PATH):
-        os.makedirs(fig_PATH)
-    PATH_DSARF = save_PATH + 'DSARF%s' %(rnn_ext)
-    
-    """
-    DSARF SETUP & Training
-    #######################################################################
-    #######################################################################
-    #######################################################################
-    #######################################################################
-    """
-    spat = None
-    if root_dir[-3:] == 'son':
-        import json
-        f = open(root_dir)
-        data_st = json.load(f)
-        if args.ID == 'bat':
-            D = len(data_st['joints']) * 3
-            spat = data_st['joints']
-            data_st = [np.array(data_st[key]).reshape(-1, D)
-                       for key in list(data_st.keys())[3:-2]]
-            if args.long:
-                tpred = sum([len(data_st[-i]) for i in range(args.last,0,-1)]) 
-                data_st = np.concatenate(data_st, axis = 0).reshape(1,-1,D)
-        else:
-            data_st = [np.array(i) for i in data_st]
-            D = data_st[0].shape[-1]
-            if args.long:
-                tpred = sum([len(data_st[-i]) for i in range(args.last,0,-1)])
-                data_st = np.concatenate(data_st, axis = 0).reshape(-1,1,D)
-            
+    return rec_loss +annealing_factor * (KL_s_0 + KL_s_t
+                                          + KL_z_0 + KL_z)
 
-    if root_dir[-3:] == 'txt':
-        import pandas as pd
-        if args.ID in ['flu', 'dengue']:
-            data_st = pd.read_csv(root_dir, sep=',')
-            years = np.array([i[:4] for i in data_st.values[:,0]], dtype = np.int)
-            data_st = [data_st.values[years==i,1:].astype('float') for i in range(2003, 2016)]
-            D = data_st[0].shape[-1]
-            if args.long:
-                tpred = sum([len(data_st[-i]) for i in range(args.last,0,-1)])
-                data_st = np.concatenate(data_st, axis = 0).reshape(1,-1,D)
 
-    if root_dir[-3:] == 'mat':
-        from scipy.io import loadmat
-        data_st = loadmat(root_dir)['tensor'].transpose(1,2,0).astype('float')  
-    if root_dir[-3:] == 'npz':
-        data_st = np.load(root_dir)['arr_0'].reshape(-1,28,288).transpose(1,2,0).astype('float')
+def compute_NRMSE(y, y_hat):
+    idxs = [(len(i), ~np.isnan(i)) for i in y]
+    RMSE = [np.power(y[i][idxs[i][1]] - y_hat[i][:idxs[i][0]][idxs[i][1]],2) for i in range(len(y))]
+    RMSE = np.sqrt(sum([i.sum() for i in RMSE])/sum([len(i) for i in RMSE]))
+    power = [y[i][idxs[i][1]]**2 for i in range(len(y))]
+    NRMSE = RMSE/np.sqrt(sum([i.sum() for i in power])/sum([len(i) for i in power]))*100
+    return NRMSE
 
-    if args.ID == 'pacific':
-        import pandas as pd
-        data_st = pd.read_csv(root_dir, sep='\t', header = None).values.reshape(-1,30*84)[3:].reshape(-1,12,30*84)
-        ## 2520 spatal locations in a grid of 30*84 for 399 months from Jan 1970 to March 2003
 
-    if args.ID == 'apnea':        
-        import pandas as pd
-        data_st = [pd.read_csv(root_dir, sep=' ', header = None).values[6201:7201,1].reshape(-1,1),
-                   pd.read_csv(root_dir, sep=' ', header = None).values[5201:6201,1].reshape(-1,1)]
-        
-        states = None
-        D = data_st[0].shape[-1]
-        if args.long:
-            tpred = sum([len(data_st[-i]) for i in range(args.last,0,-1)])
-            data_st = data_st.reshape(1,-1,D)
+# root_dir = "C:/Users/Amir/Downloads/DSARF_bat/data/bat.json"
 
- 
-    if args.ID in ['guangzhou','birmingham','hangzhou','seattle', 'pacific']:
-        D = data_st.shape[-1]
-        data_st[data_st == 0] = np.nan
-        if args.long:
-            tpred = sum([len(data_st[-i]) for i in range(args.last,0,-1)])
-            data_st = data_st.reshape(1,-1,D)
-        data_st_true = data_st.copy()
-        if args.long:
-            data_st[:,-tpred:] = np.nan
-        data_mean = [data_st[~np.isnan(data_st)].mean() for i in data_st]
-        data_std = [data_st[~np.isnan(data_st)].std() for i in data_st]
-    elif args.ID in ['flu','dengue','prec','apnea']:
-        data_st_cat = np.concatenate(data_st, axis = 0)
-        data_mean = [data_st_cat[~np.isnan(data_st_cat)].mean() for i in data_st]
-        data_std = [data_st_cat[~np.isnan(data_st_cat)].std() for i in data_st]
-        data_st_true = data_st.copy()
-        if args.long:
-            data_st[:,-tpred:] = np.nan
-    else:
-        if args.long:
-            tpred = sum([len(data_st[-i]) for i in range(args.last,0,-1)])
-            data_st = data_st.reshape(1,-1,D)
-        data_st_true = data_st.copy()
-        if args.long:
-            data_st[:,-tpred:] = np.nan
-        data_mean = [i[~np.isnan(i)].mean() for i in data_st]
-        data_std = [i[~np.isnan(i)].std() for i in data_st]
-    # normalize data for training
-    dataa = [(data_st_true[i] - data_mean[i])/data_std[i] for i in range(len(data_st_true))]
-    dataa_train = [(data_st[i] - data_mean[i])/data_std[i] for i in range(len(data_st))]
-    
-    # set parameters 
-    n_data = len(dataa_train)
-    T = max([len(i) for i in dataa_train]) # use maximum T to conveniently support varying length
-    #form data for training
-    training_set = [(torch.FloatTensor(y),torch.zeros(0),torch.LongTensor([i])) for i, y in enumerate(dataa_train)]
-    # exclude test-set from training 
-    if predict:
-        training_set_part =  training_set[-args.last:]
-        load_model = True
-    else:
-        if args.long:
-            training_set_part =  training_set.copy()          
-        else:
-            training_set_part =  training_set[:-args.last]
-    if args.long:
-        t = tpred
-    else:
-        t=args.last
-    # form classes--It's dummy for these set of experiments
-    classes = torch.LongTensor(np.zeros(n_data))
-    # initialize model
-    dsarf = DSARF(n_data = n_data,
-                T = T,
-                factor_dim = factor_dim,
-                z_dim = z_dim,
-                u_dim = u_dim,
-                transition_dim = transition_dim,
-                zF_dim = zF_dim,
-                n_class = n_class,
-                sigma_obs = sigma_obs,
-                rnn_dim = args.rnn_dim,
-                D = D,
-                L = args.lag,
-                S = args.n_state)
-    
-
-    # freeze model for prediction
-    if predict:
-        
-        dsarf.p_c.requires_grad = False
-        dsarf.p_s_0.requires_grad = False
-        dsarf.z_0_mu.requires_grad = False
-        dsarf.z_0_sig.requires_grad = False
-        
-        dsarf.q_F_loc_mu.requires_grad = False
-        dsarf.q_F_loc_sig.requires_grad = False
-        dsarf.q_z_F_mu.requires_grad = False
-        dsarf.q_z_F_sig.requires_grad = False
-        for param in dsarf.trans.parameters():
-            param.requires_grad = False
-        for param in dsarf.spat.parameters():
-            param.requires_grad = False
-        for param in dsarf.strans.parameters():
-            param.requires_grad = False
-            
-    if Restore == False:
-        # set path to save figure results during training
-        fig_PATH_train = fig_PATH + 'figs_train/'
-        if not os.path.exists(fig_PATH_train):
-            os.makedirs(fig_PATH_train)
-        
-        optim_dsarf = optim.Adam(dsarf.parameters(), lr = lr)
-        # number of parameters  
-        total_params = sum(p.numel() for p in dsarf.parameters())
-        learnable_params = sum(p.numel() for p in dsarf.parameters() if p.requires_grad)
-        print('Total Number of Parameters: %d' % total_params)
-        print('Learnable Parameters: %d' %learnable_params)
-        
-        params = {'batch_size': batch_size,
-                  'shuffle': True,
-                  'num_workers': num_workers}
-        train_loader = data.DataLoader(training_set_part, **params)
-        
-        print("Training...")
-        if load_model:
-            dsarf.load_state_dict(torch.load(PATH_DSARF,
-                              map_location=lambda storage, loc: storage))
-        for i in range(epoch_num):
-            time_start = time.time()
-            loss_value = 0.0
-            for batch_indx, batch_data in enumerate(tqdm(train_loader)):
-            # update DSARF
-                mini_batch, u_vals, mini_batch_idxs = batch_data
-                mini_batch_idxs = mini_batch_idxs.reshape(-1)
-                if u_dim == 0:
-                    u_vals = None
-    
-                y_hat,\
-                q_c, p_c,\
-                q_s_0, p_s_0,\
-                q_s_t, p_s_t,\
-                q_z_0_mus, q_z_0_sigs,\
-                z_0_mu, z_0_sig,\
-                q_z_mus, q_z_sigs,\
-                p_z_mu, p_z_sig,\
-                q_F_loc_mu, q_F_loc_sig,\
-                p_F_loc_mu, p_F_loc_sig,\
-                q_z_F_mu, q_z_F_sig,\
-                p_z_F_mu, p_z_F_sig\
-                = dsarf.forward(mini_batch, u_vals, mini_batch_idxs)
-    
-            # set gradients to zero in each iteration
-                optim_dsarf.zero_grad()
-            
-            # computing loss
-                # excluding missing locations
-                idxs_nonnan = ~torch.isnan(mini_batch)
-                if args.long:
-                    annealing_factor = 0.1 # min(1.0, 0.01 + i / T_A) # inverse temperature
-                else:
-                    annealing_factor = 0.001
-                if args.long:
-                    loss_dsarf = ELBO_Loss(mini_batch[idxs_nonnan],
-                                          y_hat[idxs_nonnan], 
-                                          q_c, p_c,
-                                          q_s_0, p_s_0,
-                                          q_s_t[:,max(args.lag):-tpred], p_s_t[:,max(args.lag):-tpred],
-                                          q_z_0_mus, q_z_0_sigs,
-                                          z_0_mu, z_0_sig,
-                                          q_z_mus[:,max(args.lag):-tpred], q_z_sigs[:,max(args.lag):-tpred],
-                                          p_z_mu[:,:,max(args.lag):-tpred], p_z_sig[:,:,max(args.lag):-tpred],
-                                          q_F_loc_mu, q_F_loc_sig,
-                                          p_F_loc_mu, p_F_loc_sig,
-                                          q_z_F_mu, q_z_F_sig,
-                                          p_z_F_mu, p_z_F_sig,
-                                          annealing_factor) 
-                else:
-                    loss_dsarf = ELBO_Loss(mini_batch[idxs_nonnan],
-                                          y_hat[idxs_nonnan], 
-                                          q_c, p_c,
-                                          q_s_0, p_s_0,
-                                          q_s_t, p_s_t,
-                                          q_z_0_mus, q_z_0_sigs,
-                                          z_0_mu, z_0_sig,
-                                          q_z_mus, q_z_sigs,
-                                          p_z_mu, p_z_sig,
-                                          q_F_loc_mu, q_F_loc_sig,
-                                          p_F_loc_mu, p_F_loc_sig,
-                                          q_z_F_mu, q_z_F_sig,
-                                          p_z_F_mu, p_z_F_sig,
-                                          annealing_factor)
+# import json
+# f = open(root_dir)
+# data_st = json.load(f)
+# D = len(data_st['joints']) * 3
+# data_st = [np.array(data_st[key]).reshape(-1, D)
+#            for key in list(data_st.keys())[3:-2]]
                 
-            # back propagation
-                loss_dsarf.backward()#(retain_graph = True)
-            # update parameters
-                optim_dsarf.step()
-            # accumulate loss    
-                loss_value += loss_dsarf.item()
-            
-            acc = torch.sum(dsarf.q_c[:,0].argmax(dim=1)==classes).float()/n_data
-            time_end = time.time()
-            print('elapsed time (min) : %0.1f' % ((time_end-time_start)/60))
-            print('====> Epoch: %d ELBO_Loss : %0.4f Acc: %0.2f'
-                  % ((i + 1), loss_value / len(train_loader.dataset), acc))
-    
-            torch.save(dsarf.state_dict(), PATH_DSARF)
-            
-            #draw plots once per 10 epochs
-            if args.strain and i % 50 == 0:
-                plot_result(dsarf, classes, fig_PATH_train,
-                            prefix = 'epoch{%.3d}_'%i,
-                            ext = ".png", data_st = [dataa, data_mean, data_std],
-                            days = t, predict = args.predict,
-                            ID = args.ID, spat = spat)
-            
-    if Restore:
-        dsarf.load_state_dict(torch.load(PATH_DSARF,
-                                        map_location=lambda storage, loc: storage))
-        params = {'batch_size': 1,
-                  'shuffle': False,
-                  'num_workers': 0}
-        train_loader = data.DataLoader(training_set, **params)
-        
-        for batch_indx, batch_data in enumerate(tqdm(train_loader)):
-        
-            mini_batch, u_vals, mini_batch_idxs = batch_data
-            mini_batch_idxs = mini_batch_idxs.reshape(-1)
-            if u_dim == 0:
-                u_vals = None
-        
-            y_hat,\
-            q_c, p_c,\
-            q_s_0, p_s_0,\
-            q_s_t, p_s_t,\
-            q_z_0_mus, q_z_0_sigs,\
-            z_0_mu, z_0_sig,\
-            q_z_mus, q_z_sigs,\
-            p_z_mu, p_z_sig,\
-            q_F_loc_mu, q_F_loc_sig,\
-            p_F_loc_mu, p_F_loc_sig,\
-            q_z_F_mu, q_z_F_sig,\
-            p_z_F_mu, p_z_F_sig\
-            = dsarf.forward(mini_batch, u_vals, mini_batch_idxs)
+# dsarf = DSARF(D, factor_dim =5, L=[1], S=2, batch_size=1, recurrent=True)
 
-        plot_result(dsarf, classes, fig_PATH,
-                    data_st = [dataa, data_mean, data_std],
-                    days = t, ID = args.ID,
-                    u_vals = u_vals, spat = spat)
+# model = dsarf.fit(data_st, 200)
+# model.plot_states()
+# model.plot_predict(data_st)
+# model.report_stats(data_st)
 
-"""
-DSARF SETUP & Training--END
-#######################################################################
-#######################################################################
-#######################################################################
-#######################################################################
-"""
