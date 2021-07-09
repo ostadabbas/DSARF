@@ -188,37 +188,13 @@ class LSTM_obs(nn.Module):
             s = self.fc3_rnn_s(s).permute(1,0,2)
             
         return z, s
-  
-    
-    
-    def __init__(self):
-        super(CNN, self).__init__()
-        #self.rnn = nn.LSTM(factor_dim, d_h, 4, batch_first=True, bidirectional=False) 
-        self.conv1 = nn.Conv1d(factor_dim, 25, 5, 1)
-        self.bn1 = nn.BatchNorm1d(25)
-        self.conv2 = nn.Conv1d(25, 15, 5, 2)
-        self.bn2 = nn.BatchNorm1d(15)
-        self.conv3 = nn.Conv1d(15, 5, 5, 2)
-        self.bn3 = nn.BatchNorm1d(5)
-        self.fc1 = nn.Linear(45, 10)
-        self.fc2 = nn.Linear(10, labels.max().item()+1)
-        self.relu = nn.ReLU()
-    def forward(self, x):
-        # x: N x T x D
-        x = self.relu(self.conv1(x.permute(0,2,1)))
-        x = self.bn1(x)
-        x = self.relu(self.conv2(x))
-        x = self.bn2(x)
-        x = self.relu(self.conv3(x))
-        x = self.bn3(x)
-        x = self.relu(self.fc1(x.reshape(x.shape[0],-1)))
-        x = self.fc2(x)
-        return xz
+
+
 
 class DSARF(nn.Module):
     """
     This PyTorch Module encapsulates the model as well as the
-    variational distribution for the Deep Markov Factor Analysis
+    variational distribution for DSARF
     """
     def __init__(self, D, factor_dim, L, S, transition_dim=None,
                  VI = {'rnn_dim': None, 'combine': False, 'S': False}, recurrent = False,
@@ -642,18 +618,7 @@ class DSARF(nn.Module):
             fig.savefig(path+'States.png', bbox_inches='tight')
 
 
-                   
-#batch*L*n_class, 1*n_class               
-#batch*S, 1*S
-# batch*T*S
-# batch*L*1*z_dim
-# L*n_class*z_dim
-# batch*T*z_dim
-# S*batch*T*z_dim
-#factor*D
-# factor*D
-# 1*zF_dim
-# 1*zF_dim
+
 def KLD_Gaussian(q_mu, q_sigma, p_mu, p_sigma):
     # 1/2 [log|Σ2|/|Σ1| −d + tr{Σ2^-1 Σ1} + (μ2−μ1)^T Σ2^-1 (μ2−μ1)]
     KLD = 1/2 * ( 2 * (p_sigma - q_sigma) 
@@ -677,7 +642,7 @@ def ELBO_Loss(mini_batch, y_hat,\
               p_z_mu, p_z_sig,\
               annealing_factor = 1):
     
-    # y_hat: S*N*T*D, mini_batch = N*T*D
+    # y_hat: N*T*D, mini_batch = N*T*D
     rec_loss = (y_hat - mini_batch).pow(2).sum()
 
     KL_s_0 = KLD_Cat(q_s_0.mean(dim=0), p_s_0).sum()
@@ -700,21 +665,3 @@ def compute_NRMSE(y, y_hat):
     power = [y[i][idxs[i][1]]**2 for i in range(len(y))]
     NRMSE = RMSE/np.sqrt(sum([i.sum() for i in power])/sum([len(i) for i in power]))*100
     return NRMSE
-
-
-# root_dir = "C:/Users/Amir/Downloads/DSARF_bat/data/bat.json"
-
-# import json
-# f = open(root_dir)
-# data_st = json.load(f)
-# D = len(data_st['joints']) * 3
-# data_st = [np.array(data_st[key]).reshape(-1, D)
-#            for key in list(data_st.keys())[3:-2]]
-                
-# dsarf = DSARF(D, factor_dim =5, L=[1], S=2, batch_size=1, recurrent=True)
-
-# model = dsarf.fit(data_st, 200)
-# model.plot_states()
-# model.plot_predict(data_st)
-# model.report_stats(data_st)
-
