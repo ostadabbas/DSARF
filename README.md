@@ -11,9 +11,11 @@ To access older version of our code see [DSARF_v0.0](./DSARF_v0.0)
 #### Dependencies: 
 Pytorch, Numpy, Scipy, Matplotlib
 
-#### citation
+#### Citation
 
-`@inproceedings{farnoosh2021deep,
+If you find our work useful in your research please consider citing our paper:
+```
+@inproceedings{farnoosh2021deep,
   title={Deep Switching Auto-Regressive Factorization: Application to Time Series Forecasting},
   author={Farnoosh, Amirreza and Azari, Bahar and Ostadabbas, Sarah},
   booktitle={Proceedings of the AAAI Conference on Artificial Intelligence},
@@ -21,4 +23,5 @@ Pytorch, Numpy, Scipy, Matplotlib
   number={8},
   pages={7394--7403},
   year={2021}
-}`
+}
+```
