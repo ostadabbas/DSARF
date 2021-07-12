@@ -5,7 +5,7 @@
 
 This repository is a user-friendly pytorch implementation of our AAAI'21 paper: [Deep switching auto-regressive factorization](https://arxiv.org/abs/2009.05135). DSARF performs switching dynamical systems modeling.
 
-This [notebook](./DSARF_Examples.ipynb) includes several examples of using DSARF for short- and long-term forecasting and dynamical state estimation ([run in Colab](https://colab.research.google.com/github/amirfarnoosh/DSARF/blob/master/DSARF_Examples.ipynb)).
+This [notebook](./DSARF_Examples.ipynb) includes several examples of using DSARF for short- and long-term forecasting and dynamical state estimation ([click to open /run in Colab](https://colab.research.google.com/github/amirfarnoosh/DSARF/blob/master/DSARF_Examples.ipynb)).
 
 Also, check this [notebook](./Documentation.ipynb) for DSARF documentation and model overview.
 
