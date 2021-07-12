@@ -1,3 +1,5 @@
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/amirfarnoosh/DSARF/blob/master/DSARF_Examples.ipynb)
+
 # Deep Switching Auto-Regressive Factorization (DSARF)
 
 This repository is a user-friendly pytorch implementation of our AAAI'21 paper: [Deep switching auto-regressive factorization](https://arxiv.org/abs/2009.05135). DSARF performs switching dynamical systems modeling.
